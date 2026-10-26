@@ -63,14 +63,15 @@ index 0000000..610ade2
 +esac
 diff --git a/test/jit-parity-529962.test.js b/test/jit-parity-529962.test.js
 new file mode 100644
-index 0000000..4845a54
+index 0000000..514b28c
 --- /dev/null
 +++ b/test/jit-parity-529962.test.js
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,211 @@
 +'use strict'
 +
 +const { test } = require('node:test')
 +const Fastify = require('fastify')
++const { buildSchema } = require('graphql')
 +const GQL = require('..')
 +
 +const schema = `
@@ -81,12 +82,18 @@ index 0000000..4845a54
 +    dogs: [Dog]
 +    boom: Int
 +  }
-+  type Mutation { bump(by: Int!): Int }
 +`
 +
-+// Each app gets its own resolvers so mutations and loader calls never leak between apps.
++// A different schema for replaceSchema: `dogs` and `boom` are gone and `version` is new.
++const replacementSchema = `
++  type Query {
++    add(x: Int!, y: Int = 1): Int
++    hello(name: String): String
++    version: Int
++  }
++`
++
 +function makeResolvers () {
-+  let counter = 0
 +  return {
 +    Query: {
 +      add: (_, { x, y }) => x + y,
@@ -94,8 +101,7 @@ index 0000000..4845a54
 +      dogs: () => [{ name: 'max' }, { name: 'rex' }],
 +      boom: () => { throw new Error('kaboom') }
 +    },
-+    Dog: { owner: (dog) => `owner of ${dog.name}` },
-+    Mutation: { bump: (_, { by }) => (counter += by) }
++    Dog: { owner: (dog) => `owner of ${dog.name}` }
 +  }
 +}
 +
@@ -105,19 +111,21 @@ index 0000000..4845a54
 +  reference: { cache: false },
 +  'default cache': {},
 +  'jit: 1': { jit: 1 },
-+  'adaptive jit': { jit: { minCount: 1, eluThreshold: 1 } }
++  'jit: 2': { jit: 2 },
++  'adaptive jit': { jit: { minCount: 1, eluThreshold: 1 } },
++  'adaptive jit, minCount 2': { jit: { minCount: 2, eluThreshold: 1, maxCompilePerTick: 4, maxQueueSize: 10 } }
 +}
 +
 +// A change queued for an app runs inside the next request's preExecution hook, after that request has read the
 +// caches but before it executes, like a slow auth check that overlaps a runtime update.
 +const changesDuringRequest = new WeakMap()
 +
-+async function buildApps (t, extra = {}) {
++async function buildApps (t) {
 +  const apps = {}
 +  for (const [name, opts] of Object.entries(modes)) {
 +    const app = Fastify()
 +    t.after(() => app.close())
-+    await app.register(GQL, { schema, resolvers: makeResolvers(), ...extra, ...opts })
++    await app.register(GQL, { schema, resolvers: makeResolvers(), ...opts })
 +    app.graphql.addHook('preExecution', async () => {
 +      const change = changesDuringRequest.get(app)
 +      if (change) {
@@ -131,13 +139,16 @@ index 0000000..4845a54
 +  return apps
 +}
 +
-+// Lets the adaptive compiler run between requests, so later requests can use compiled queries.
-+const settle = () => new Promise((resolve) => setTimeout(resolve, 15))
++// The adaptive compiler first tries right after a request, while the event loop is busy, so it backs off and retries
++// from a 50ms timer. Node runs timers in order of when they are due, so this one always fires after that retry and
++// the next request can use what it compiled.
++const settleAdaptive = () => new Promise((resolve) => setTimeout(resolve, 60))
 +
-+// Runs the same steps against every app and returns, per app, what each request got back.
++// Runs the same steps against every app and returns, per app, the status code and parsed body of each request.
 +async function play (apps, steps) {
 +  const results = {}
 +  for (const [name, app] of Object.entries(apps)) {
++    const adaptive = typeof modes[name].jit === 'object'
 +    const out = []
 +    for (const step of steps) {
 +      if (typeof step === 'function') {
@@ -149,8 +160,10 @@ index 0000000..4845a54
 +        changesDuringRequest.set(app, during)
 +      }
 +      const res = await app.inject({ method: 'POST', url: '/graphql', body: { query, variables } })
-+      out.push(`${res.statusCode} ${res.body}`)
-+      await settle()
++      out.push({ status: res.statusCode, body: res.json() })
++      if (adaptive) {
++        await settleAdaptive()
++      }
 +    }
 +    results[name] = out
 +  }
@@ -165,6 +178,9 @@ index 0000000..4845a54
 +
 +const repeat = (step, times) => Array.from({ length: times }, () => step)
 +
++const queryFieldNames = '{ __type(name: "Query") { fields { name } } }'
++const fieldNames = (result) => result.body.data.__type.fields.map((field) => field.name)
++
 +test('resolvers replaced with defineResolvers apply to queries that were already compiled', async (t) => {
 +  const apps = await buildApps(t)
 +  const results = await play(apps, [
@@ -177,7 +193,10 @@ index 0000000..4845a54
 +    ...repeat({ query: '{ boom hello(name: "z") }' }, 3)
 +  ])
 +  assertSameAsReference(t, results)
-+  t.assert.strictEqual(results['jit: 1'][8], '200 {"data":{"add":11,"dogs":[{"name":"max","owner":"nobody"},{"name":"rex","owner":"nobody"}]}}')
++  t.assert.deepStrictEqual(results.reference[8], {
++    status: 200,
++    body: { data: { add: 11, dogs: [{ name: 'max', owner: 'nobody' }, { name: 'rex', owner: 'nobody' }] } }
++  })
 +})
 +
 +test('a schema extension applies to queries that failed or were compiled before it', async (t) => {
@@ -194,40 +213,68 @@ index 0000000..4845a54
 +    ...repeat({ query: '{ dogs { name age } }' }, 2)
 +  ])
 +  assertSameAsReference(t, results)
-+  t.assert.strictEqual(results['default cache'][6], '200 {"data":{"extra":42,"add":-1}}')
++  t.assert.strictEqual(results.reference[0].status, 400)
++  t.assert.deepStrictEqual(results.reference[6], { status: 200, body: { data: { extra: 42, add: -1 } } })
 +})
 +
-+test('resolvers defined after replaceSchema apply to queries compiled against the new schema', async (t) => {
++test('a different schema installed with replaceSchema applies to queries used before it', async (t) => {
 +  const apps = await buildApps(t)
-+  const query = '{ hello(name: "q") add(x: 1) }'
-+  const results = await play(apps, [
-+    ...repeat({ query }, 3),
-+    (app) => app.graphql.replaceSchema(app.graphql.schema),
-+    ...repeat({ query }, 3),
-+    (app) => app.graphql.defineResolvers({ Query: { hello: () => 'replaced' } }),
-+    ...repeat({ query }, 3)
-+  ])
++  const steps = [
++    ...repeat({ query: '{ version hello(name: "q") }' }, 3),
++    ...repeat({ query: '{ dogs { name } add(x: 1) }' }, 3),
++    ...repeat({ query: '{ hello(name: "q") add(x: 1) }' }, 3),
++    (app) => {
++      app.graphql.replaceSchema(buildSchema(replacementSchema))
++      app.graphql.defineResolvers({ Query: { version: () => 2, hello: () => 'replaced', add: (_, { x }) => x * 100 } })
++    },
++    ...repeat({ query: '{ version hello(name: "q") }' }, 3),
++    ...repeat({ query: '{ dogs { name } add(x: 1) }' }, 3),
++    ...repeat({ query: '{ hello(name: "q") add(x: 1) }' }, 3),
++    (app) => app.graphql.defineResolvers({ Query: { hello: () => 'defined later' } }),
++    ...repeat({ query: '{ hello(name: "q") add(x: 1) }' }, 2)
++  ]
++  const results = await play(apps, steps)
 +  assertSameAsReference(t, results)
++  t.assert.strictEqual(results.reference[0].status, 400)
++  t.assert.deepStrictEqual(results.reference[9], { status: 200, body: { data: { version: 2, hello: 'replaced' } } })
++  t.assert.strictEqual(results.reference[12].status, 400)
++  t.assert.deepStrictEqual(results.reference[18], { status: 200, body: { data: { hello: 'defined later', add: 100 } } })
 +})
 +
-+test('a change made while a request waits in its hooks applies to that request', async (t) => {
++test('a resolver change made while a request waits in its hooks applies to that request', async (t) => {
 +  const apps = await buildApps(t)
 +  const query = '{ add(x: 1) dogs { name owner } }'
 +  const results = await play(apps, [
 +    ...repeat({ query }, 3),
 +    { query, during: (app) => app.graphql.defineResolvers({ Query: { add: () => 100 }, Dog: { owner: () => 'nobody' } }) },
-+    ...repeat({ query }, 2),
-+    {
-+      query,
-+      during: (app) => {
-+        app.graphql.replaceSchema(app.graphql.schema)
-+        app.graphql.defineResolvers({ Query: { add: () => 200 } })
-+      }
-+    },
-+    ...repeat({ query }, 2),
-+    { query, during: (app) => app.graphql.extendSchema('extend type Query { extra: Int }') },
 +    ...repeat({ query }, 2)
 +  ])
 +  assertSameAsReference(t, results)
-+  t.assert.strictEqual(results['jit: 1'][3], '200 {"data":{"add":100,"dogs":[{"name":"max","owner":"nobody"},{"name":"rex","owner":"nobody"}]}}')
++  t.assert.deepStrictEqual(results.reference[3], {
++    status: 200,
++    body: { data: { add: 100, dogs: [{ name: 'max', owner: 'nobody' }, { name: 'rex', owner: 'nobody' }] } }
++  })
++})
++
++test('a schema change made while a request waits in its hooks applies to that request', async (t) => {
++  const apps = await buildApps(t)
++  const query = '{ hello(name: "q") add(x: 1) }'
++  const results = await play(apps, [
++    ...repeat({ query: queryFieldNames }, 3),
++    { query: queryFieldNames, during: (app) => app.graphql.extendSchema('extend type Query { extra: Int }') },
++    ...repeat({ query }, 3),
++    {
++      query,
++      during: (app) => {
++        app.graphql.replaceSchema(buildSchema(replacementSchema))
++        app.graphql.defineResolvers({ Query: { hello: () => 'replaced' } })
++      }
++    },
++    ...repeat({ query }, 2)
++  ])
++  assertSameAsReference(t, results)
++  t.assert.deepStrictEqual(fieldNames(results.reference[0]), ['add', 'hello', 'dogs', 'boom'])
++  t.assert.deepStrictEqual(fieldNames(results.reference[3]), ['add', 'hello', 'dogs', 'boom', 'extra'])
++  // the replacement schema has no resolver for `add`, so the default resolver returns null
++  t.assert.deepStrictEqual(results.reference[7], { status: 200, body: { data: { hello: 'replaced', add: null } } })
 +})

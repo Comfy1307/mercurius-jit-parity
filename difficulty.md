@@ -14,12 +14,13 @@ Target: exactly one of Nova, Orion and Vega solves it, more than 0% and at most 
   - only `replaceSchema` clears anything today, and resolvers defined after it still miss queries compiled against the new schema.
 - Clearing the caches is not enough. A request reads its cached entry before the `preExecution` hooks run, so a change made while a hook is awaiting leaves that request holding a compiled query with the old resolvers. Without caching, `execute` would look up the new ones. A fix has to notice that the entry it already holds is out of date, and skip compiling, enqueuing and running compiled queries for it.
 - The obvious "clear everything on every change" also runs during plugin start-up (`defineResolvers` is how the initial resolvers are installed). An existing test pins the adaptive compiler being cleared exactly once, on close. So clearing has to be limited to caches that are actually in use.
-- The tests compare four servers fed the same request and change sequence: a reference with `cache: false`, the default cache, `jit: 1` and adaptive JIT, with some changes made from inside a `preExecution` hook while a request is in flight. Every response, status code included, must match the reference.
+- The tests compare six servers fed the same request and change sequence: a reference with `cache: false`, the default cache, `jit: 1`, `jit: 2` and two adaptive JIT configurations. Some changes are made from inside a `preExecution` hook while a request is in flight. Every response's status code and parsed body must match the reference.
+- The adaptive compiler's first attempt sees a busy event loop and retries from a 50ms timer, so the tests wait on a 60ms timer after each adaptive request. Timers run in order of when they are due, so compilation has always happened before the next request, and every JIT mode differs from the reference on base.
 
 ## Scope
 
 - Solution: `index.js` (cache clearing on `extendSchema`/`defineResolvers`, shared with `replaceSchema`, plus a cache generation that in-flight requests check before using compiled queries) and docs.
-- Tests: 4 tests, all of which fail on the base commit and pass with the fix. The existing 422 tests still pass.
+- Tests: 5 tests, all of which fail on the base commit and pass with the fix. The existing 422 tests still pass.
 - The repo's 100% coverage gate already fails on base in this environment (graphql 17-only tests are skipped).
 
 ## Upstream status
