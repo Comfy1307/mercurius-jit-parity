@@ -1,0 +1,75 @@
+diff --git a/docs/api/options.md b/docs/api/options.md
+index 6c5ef3c..dbffc5b 100644
+--- a/docs/api/options.md
++++ b/docs/api/options.md
+@@ -242,7 +242,7 @@ run()
+ 
+ #### app.graphql.extendSchema(schema), app.graphql.defineResolvers(resolvers) and app.graphql.defineLoaders(loaders)
+ 
+-It is possible to add schemas, resolvers and loaders in separate fastify plugins, like so:
++It is possible to add schemas, resolvers and loaders in separate fastify plugins, like so. Changes made after the server has started apply from the next request, even for queries that were already cached or compiled:
+ 
+ ```js
+ const Fastify = require('fastify')
+diff --git a/index.js b/index.js
+index c79b61b..286312c 100644
+--- a/index.js
++++ b/index.js
+@@ -364,13 +364,9 @@ const mercurius = fp(async function (app, opts) {
+     })
+   }
+ 
+-  fastifyGraphQl.replaceSchema = function (s) {
+-    if (!s || typeof s !== 'object') {
+-      throw new MER_ERR_INVALID_OPTS('Must provide valid Document AST')
+-    }
+-
+-    fastifyGraphQl.schema = defer ? addDeferDirective(s) : s
+-
++  // Parsed documents, cached validation errors and compiled queries all depend on the schema and its resolvers,
++  // so they are dropped whenever either changes.
++  function clearCaches () {
+     if (lru) {
+       lru.clear()
+     }
+@@ -382,6 +378,23 @@ const mercurius = fp(async function (app, opts) {
+     }
+   }
+ 
++  // Resolvers and schema extensions are also applied while the plugin starts, before any query has been cached.
++  function clearUsedCaches () {
++    if ((lru && lru.size > 0) || (lruErrors && lruErrors.size > 0)) {
++      clearCaches()
++    }
++  }
++
++  fastifyGraphQl.replaceSchema = function (s) {
++    if (!s || typeof s !== 'object') {
++      throw new MER_ERR_INVALID_OPTS('Must provide valid Document AST')
++    }
++
++    fastifyGraphQl.schema = defer ? addDeferDirective(s) : s
++
++    clearCaches()
++  }
++
+   fastifyGraphQl.extendSchema = fastifyGraphQl.extendSchema || function (s) {
+     if (typeof s === 'string') {
+       s = parse(s, gqlParseOpts)
+@@ -390,6 +403,7 @@ const mercurius = fp(async function (app, opts) {
+     }
+ 
+     fastifyGraphQl.schema = extendSchema(fastifyGraphQl.schema, s)
++    clearUsedCaches()
+ 
+     const context = assignApplicationHooksToContext({}, fastifyGraphQl[kHooks])
+ 
+@@ -454,6 +468,8 @@ const mercurius = fp(async function (app, opts) {
+         throw new MER_ERR_INVALID_OPTS(`Cannot find type ${name}`)
+       }
+     }
++
++    clearUsedCaches()
+   }
+ 
+   let factory

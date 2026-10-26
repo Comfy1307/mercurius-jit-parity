@@ -1,0 +1,197 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..610ade2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,57 @@
++#!/bin/bash
++set -uo pipefail
++
++OUTPUT_PATH=""
++MODE=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path)
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#*=}"
++      shift
++      ;;
++    *)
++      MODE="$1"
++      shift
++      ;;
++  esac
++done
++
++NEW_TESTS=(test/jit-parity-529962.test.js)
++
++# Resolved against the caller's directory, before changing to the repository
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  OUTPUT_PATH="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")"
++fi
++
++cd "$(dirname "$0")"
++
++run_borp () {
++  local reporters=(--reporter spec)
++  if [ -n "$OUTPUT_PATH" ]; then
++    # The JUnit reporter also records test files that fail to load as failures
++    reporters+=(--reporter "junit:$OUTPUT_PATH")
++  fi
++  node_modules/.bin/borp --timeout 300000 "${reporters[@]}" "$@"
++}
++
++case "$MODE" in
++  base)
++    ignore=()
++    for test_file in "${NEW_TESTS[@]}"; do
++      ignore+=(--ignore "$test_file")
++    done
++    run_borp "${ignore[@]}" 'test/**/*.test.js'
++    ;;
++  new)
++    run_borp "${NEW_TESTS[@]}"
++    ;;
++  *)
++    echo "Usage: ./test.sh --output_path <path> [base|new]" >&2
++    exit 1
++    ;;
++esac
+diff --git a/test/jit-parity-529962.test.js b/test/jit-parity-529962.test.js
+new file mode 100644
+index 0000000..af3ac91
+--- /dev/null
++++ b/test/jit-parity-529962.test.js
+@@ -0,0 +1,128 @@
++'use strict'
++
++const { test } = require('node:test')
++const Fastify = require('fastify')
++const GQL = require('..')
++
++const schema = `
++  type Dog { name: String!, owner: String }
++  type Query {
++    add(x: Int!, y: Int = 1): Int
++    hello(name: String): String
++    dogs: [Dog]
++    boom: Int
++  }
++  type Mutation { bump(by: Int!): Int }
++`
++
++// Each app gets its own resolvers so mutations and loader calls never leak between apps.
++function makeResolvers () {
++  let counter = 0
++  return {
++    Query: {
++      add: (_, { x, y }) => x + y,
++      hello: (_, { name }) => `hello ${name}`,
++      dogs: () => [{ name: 'max' }, { name: 'rex' }],
++      boom: () => { throw new Error('kaboom') }
++    },
++    Dog: { owner: (dog) => `owner of ${dog.name}` },
++    Mutation: { bump: (_, { by }) => (counter += by) }
++  }
++}
++
++// The reference app caches nothing and compiles nothing, so every request is parsed, validated and executed
++// against the schema and resolvers as they are at that moment.
++const modes = {
++  reference: { cache: false },
++  'default cache': {},
++  'jit: 1': { jit: 1 },
++  'adaptive jit': { jit: { minCount: 1, eluThreshold: 1 } }
++}
++
++async function buildApps (t, extra = {}) {
++  const apps = {}
++  for (const [name, opts] of Object.entries(modes)) {
++    const app = Fastify()
++    t.after(() => app.close())
++    await app.register(GQL, { schema, resolvers: makeResolvers(), ...extra, ...opts })
++    await app.ready()
++    apps[name] = app
++  }
++  return apps
++}
++
++// Lets the adaptive compiler run between requests, so later requests can use compiled queries.
++const settle = () => new Promise((resolve) => setTimeout(resolve, 15))
++
++// Runs the same steps against every app and returns, per app, what each request got back.
++async function play (apps, steps) {
++  const results = {}
++  for (const [name, app] of Object.entries(apps)) {
++    const out = []
++    for (const step of steps) {
++      if (typeof step === 'function') {
++        await step(app)
++        continue
++      }
++      const { query, variables } = step
++      const res = await app.inject({ method: 'POST', url: '/graphql', body: { query, variables } })
++      out.push(`${res.statusCode} ${res.body}`)
++      await settle()
++    }
++    results[name] = out
++  }
++  return results
++}
++
++function assertSameAsReference (t, results) {
++  for (const [name, out] of Object.entries(results)) {
++    t.assert.deepStrictEqual([name, out], [name, results.reference])
++  }
++}
++
++const repeat = (step, times) => Array.from({ length: times }, () => step)
++
++test('resolvers replaced with defineResolvers apply to queries that were already compiled', async (t) => {
++  const apps = await buildApps(t)
++  const results = await play(apps, [
++    ...repeat({ query: '{ add(x: 1) dogs { name owner } }' }, 3),
++    ...repeat({ query: 'query($x: Int!) { add(x: $x) }', variables: { x: 5 } }, 3),
++    (app) => app.graphql.defineResolvers({ Query: { add: (_, { x, y }) => x * 10 + y }, Dog: { owner: () => 'nobody' } }),
++    ...repeat({ query: '{ add(x: 1) dogs { name owner } }' }, 3),
++    ...repeat({ query: 'query($x: Int!) { add(x: $x) }', variables: { x: 5 } }, 3),
++    (app) => app.graphql.defineResolvers({ Query: { boom: () => 7 } }),
++    ...repeat({ query: '{ boom hello(name: "z") }' }, 3)
++  ])
++  assertSameAsReference(t, results)
++  t.assert.strictEqual(results['jit: 1'][8], '200 {"data":{"add":11,"dogs":[{"name":"max","owner":"nobody"},{"name":"rex","owner":"nobody"}]}}')
++})
++
++test('a schema extension applies to queries that failed or were compiled before it', async (t) => {
++  const apps = await buildApps(t)
++  const results = await play(apps, [
++    ...repeat({ query: '{ extra add(x: 3) }' }, 3),
++    ...repeat({ query: '{ add(x: 3) dogs { name } }' }, 3),
++    (app) => {
++      app.graphql.extendSchema('extend type Query { extra: Int } extend type Dog { age: Int }')
++      app.graphql.defineResolvers({ Query: { extra: () => 42, add: () => -1 }, Dog: { age: () => 3 } })
++    },
++    ...repeat({ query: '{ extra add(x: 3) }' }, 3),
++    ...repeat({ query: '{ add(x: 3) dogs { name } }' }, 3),
++    ...repeat({ query: '{ dogs { name age } }' }, 2)
++  ])
++  assertSameAsReference(t, results)
++  t.assert.strictEqual(results['default cache'][6], '200 {"data":{"extra":42,"add":-1}}')
++})
++
++test('resolvers defined after replaceSchema apply to queries compiled against the new schema', async (t) => {
++  const apps = await buildApps(t)
++  const query = '{ hello(name: "q") add(x: 1) }'
++  const results = await play(apps, [
++    ...repeat({ query }, 3),
++    (app) => app.graphql.replaceSchema(app.graphql.schema),
++    ...repeat({ query }, 3),
++    (app) => app.graphql.defineResolvers({ Query: { hello: () => 'replaced' } }),
++    ...repeat({ query }, 3)
++  ])
++  assertSameAsReference(t, results)
++})
