@@ -63,10 +63,10 @@ index 0000000..610ade2
 +esac
 diff --git a/test/jit-parity-529962.test.js b/test/jit-parity-529962.test.js
 new file mode 100644
-index 0000000..af3ac91
+index 0000000..4845a54
 --- /dev/null
 +++ b/test/jit-parity-529962.test.js
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,164 @@
 +'use strict'
 +
 +const { test } = require('node:test')
@@ -108,12 +108,23 @@ index 0000000..af3ac91
 +  'adaptive jit': { jit: { minCount: 1, eluThreshold: 1 } }
 +}
 +
++// A change queued for an app runs inside the next request's preExecution hook, after that request has read the
++// caches but before it executes, like a slow auth check that overlaps a runtime update.
++const changesDuringRequest = new WeakMap()
++
 +async function buildApps (t, extra = {}) {
 +  const apps = {}
 +  for (const [name, opts] of Object.entries(modes)) {
 +    const app = Fastify()
 +    t.after(() => app.close())
 +    await app.register(GQL, { schema, resolvers: makeResolvers(), ...extra, ...opts })
++    app.graphql.addHook('preExecution', async () => {
++      const change = changesDuringRequest.get(app)
++      if (change) {
++        changesDuringRequest.delete(app)
++        await change(app)
++      }
++    })
 +    await app.ready()
 +    apps[name] = app
 +  }
@@ -133,7 +144,10 @@ index 0000000..af3ac91
 +        await step(app)
 +        continue
 +      }
-+      const { query, variables } = step
++      const { query, variables, during } = step
++      if (during) {
++        changesDuringRequest.set(app, during)
++      }
 +      const res = await app.inject({ method: 'POST', url: '/graphql', body: { query, variables } })
 +      out.push(`${res.statusCode} ${res.body}`)
 +      await settle()
@@ -194,4 +208,26 @@ index 0000000..af3ac91
 +    ...repeat({ query }, 3)
 +  ])
 +  assertSameAsReference(t, results)
++})
++
++test('a change made while a request waits in its hooks applies to that request', async (t) => {
++  const apps = await buildApps(t)
++  const query = '{ add(x: 1) dogs { name owner } }'
++  const results = await play(apps, [
++    ...repeat({ query }, 3),
++    { query, during: (app) => app.graphql.defineResolvers({ Query: { add: () => 100 }, Dog: { owner: () => 'nobody' } }) },
++    ...repeat({ query }, 2),
++    {
++      query,
++      during: (app) => {
++        app.graphql.replaceSchema(app.graphql.schema)
++        app.graphql.defineResolvers({ Query: { add: () => 200 } })
++      }
++    },
++    ...repeat({ query }, 2),
++    { query, during: (app) => app.graphql.extendSchema('extend type Query { extra: Int }') },
++    ...repeat({ query }, 2)
++  ])
++  assertSameAsReference(t, results)
++  t.assert.strictEqual(results['jit: 1'][3], '200 {"data":{"add":100,"dogs":[{"name":"max","owner":"nobody"},{"name":"rex","owner":"nobody"}]}}')
 +})

@@ -12,10 +12,10 @@ index 6c5ef3c..dbffc5b 100644
  ```js
  const Fastify = require('fastify')
 diff --git a/index.js b/index.js
-index c79b61b..286312c 100644
+index c79b61b..e5702d7 100644
 --- a/index.js
 +++ b/index.js
-@@ -364,13 +364,9 @@ const mercurius = fp(async function (app, opts) {
+@@ -364,13 +364,14 @@ const mercurius = fp(async function (app, opts) {
      })
    }
  
@@ -26,13 +26,18 @@ index c79b61b..286312c 100644
 -
 -    fastifyGraphQl.schema = defer ? addDeferDirective(s) : s
 -
++  // Bumped whenever cached entries are dropped, so a request that read an entry before a change made while it was
++  // waiting in its hooks can tell that entry is out of date.
++  let cacheGeneration = 0
++
 +  // Parsed documents, cached validation errors and compiled queries all depend on the schema and its resolvers,
 +  // so they are dropped whenever either changes.
 +  function clearCaches () {
++    cacheGeneration++
      if (lru) {
        lru.clear()
      }
-@@ -382,6 +378,23 @@ const mercurius = fp(async function (app, opts) {
+@@ -382,6 +383,23 @@ const mercurius = fp(async function (app, opts) {
      }
    }
  
@@ -56,7 +61,7 @@ index c79b61b..286312c 100644
    fastifyGraphQl.extendSchema = fastifyGraphQl.extendSchema || function (s) {
      if (typeof s === 'string') {
        s = parse(s, gqlParseOpts)
-@@ -390,6 +403,7 @@ const mercurius = fp(async function (app, opts) {
+@@ -390,6 +408,7 @@ const mercurius = fp(async function (app, opts) {
      }
  
      fastifyGraphQl.schema = extendSchema(fastifyGraphQl.schema, s)
@@ -64,7 +69,7 @@ index c79b61b..286312c 100644
  
      const context = assignApplicationHooksToContext({}, fastifyGraphQl[kHooks])
  
-@@ -454,6 +468,8 @@ const mercurius = fp(async function (app, opts) {
+@@ -454,6 +473,8 @@ const mercurius = fp(async function (app, opts) {
          throw new MER_ERR_INVALID_OPTS(`Cannot find type ${name}`)
        }
      }
@@ -73,3 +78,39 @@ index c79b61b..286312c 100644
    }
  
    let factory
+@@ -637,7 +658,7 @@ const mercurius = fp(async function (app, opts) {
+       }
+ 
+       if (lru) {
+-        lru.set(source, { document, validationErrors, count: 1, jit: null })
++        lru.set(source, { document, validationErrors, count: 1, jit: null, generation: cacheGeneration })
+       }
+     } else {
+       document = cached.document
+@@ -688,8 +709,11 @@ const mercurius = fp(async function (app, opts) {
+       }))
+     }
+ 
++    // a compiled query captured the schema and resolvers from before the change, so only the executor below is current
++    const stale = cached && cached.generation !== cacheGeneration
++
+     // minJit is 0 by default
+-    if (shouldCompileJit) {
++    if (shouldCompileJit && !stale) {
+       if (!modifiedSchema && !modifiedDocument) {
+         // can compile only when the schema and document are not modified
+         cached.jit = compileQuery(fastifyGraphQl.schema, document, operationName, opts.compilerOptions)
+@@ -699,11 +723,11 @@ const mercurius = fp(async function (app, opts) {
+       }
+     }
+ 
+-    if (adaptiveJit && !modifiedSchema && !modifiedDocument) {
++    if (adaptiveJit && !stale && !modifiedSchema && !modifiedDocument) {
+       adaptiveJit.maybeEnqueue(cached, document, operationName)
+     }
+ 
+-    if (cached && cached.jit !== null && !modifiedSchema && !modifiedDocument && isCompiledQuery(cached.jit)) {
++    if (cached && !stale && cached.jit !== null && !modifiedSchema && !modifiedDocument && isCompiledQuery(cached.jit)) {
+       const execution = await cached.jit.query(root, context, modifiedVariables || variables || {})
+       return maybeFormatErrors(execution, context)
+     }
