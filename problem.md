@@ -1,7 +1,7 @@
-We change resolvers and the schema while the server is running, and some responses don't follow. With jit on, after we swap a resolver with defineResolvers, queries that were already compiled keep calling the old one.
+when we change resolvers/schema on a live server there are some cases where things dont update. if you have jit enabled and change a resolver using defineResolvers. Any query that has been compiled will still use the previous resolver.
 
-Separately, after extendSchema a query that failed before the extension keeps failing with the old validation error, even though the field exists now.
+After extending the schema using extendSchema a query that was erroring out will continue to error out with the old schema error. even though it has the field now. 
 
-It also goes wrong for requests already in flight. If a resolver is swapped while a request is still waiting in its hooks, that request can still run the old resolver once it executes.
+if a request is currently going through the hooks it can also continue to use the previous resolver when the query runs.
 
-Changing the schema or resolvers while the server is running (defineResolvers, extendSchema, replaceSchema) should apply to the very next request, whether or not that query was seen or compiled before. It should also apply to any request that hasn't started executing yet. Turning jit on, as a number or with the adaptive options, should not change that.
+any changes made to the schema/resolvers on a running server should affect the next request regardless of if the query was previously used or not. this includes changing defineResolvers, extendSchema and replaceSchema. If a request is still going through the hooks when the change is made it should get the change too. Enabling jit with a number or the options for adaptive should not impact this.
